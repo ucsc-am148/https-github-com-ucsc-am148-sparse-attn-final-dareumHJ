@@ -161,6 +161,8 @@ def _bwd_dq_kernel(
     BLOCK_D: tl.constexpr,
     D: tl.constexpr,
 ):
+    # calcualtes dQi for a query block i
+    # fixed tensor? -> Q_i, dO_i, L_i, D_i for the query block i
     LOG2E: tl.constexpr = 1.4426950408889634
     bh = tl.program_id(0)
     qb = tl.program_id(1)
@@ -186,6 +188,7 @@ def _bwd_dq_kernel(
     qk_scale = sm_scale * LOG2E
     acc_dq = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
 
+    # Iterate over row-direction blocks to find the key blocks this query block attensd
     for idx in range(row_start, row_end):
         kb  = tl.load(qci_ptr + idx)
         offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -200,6 +203,7 @@ def _bwd_dq_kernel(
         s  = tl.dot(q, tl.trans(k)).to(tl.float32) * qk_scale
         s  = tl.where(k_mask[None, :], s, float('-inf'))
 
+        # restore P from the forward pass
         p  = tl.exp2(s - L_i[:, None])
 
         dp = tl.dot(do, tl.trans(v)).to(tl.float32)
@@ -224,6 +228,8 @@ def _bwd_dkv_kernel(
     BLOCK_D: tl.constexpr,
     D: tl.constexpr,
 ):
+    # calculates dKj and dVj for a key block j
+    # fixed tensor? -> K_j, V_j for the key block j
     LOG2E: tl.constexpr = 1.4426950408889634
     bh = tl.program_id(0)
     kb = tl.program_id(1)
@@ -248,6 +254,7 @@ def _bwd_dkv_kernel(
     acc_dv = tl.zeros((BLOCK_K, D), dtype=tl.float32)
     qk_scale = sm_scale * LOG2E
 
+    # Iterate over col-direction blocks to find the query blocks that attended this key block
     for idx in range(row_start, row_end):
         qb  = tl.load(kci_ptr + idx)
         offs_q = qb * BLOCK_Q + tl.arange(0, BLOCK_Q)
@@ -265,6 +272,7 @@ def _bwd_dkv_kernel(
         s  = tl.dot(q, tl.trans(k)).to(tl.float32) * qk_scale
         s  = tl.where(q_mask[:, None] & k_mask[None, :], s, float('-inf'))
 
+        # restore P from the forward pass
         P  = tl.exp2(s - L_i[:, None])
 
         acc_dv += tl.dot(tl.trans(P).to(do.dtype), do).to(tl.float32)
@@ -383,7 +391,7 @@ def sparse_flash_backward(Q, K, V, O, L, dO,
     Of = O.reshape(BH, T, d)
     dOf = dO.reshape(BH, T, d)
     Lf = L.reshape(BH, T)
-    # calculate D = sum_dO_O for each query position
+    # pre-calculate D = sum_dO_O for each query position
     D = (dO.to(torch.float32) * O.to(torch.float32)).sum(dim=-1)
     Df = D.reshape(BH, T)
 
@@ -399,12 +407,15 @@ def sparse_flash_backward(Q, K, V, O, L, dO,
     st_b, st_t, st_d = Qf.stride()
     st_lb = Lf.stride(0)
 
+    # query-block view kernel for dQ
     _bwd_dq_kernel[(BH, T // BLOCK_Q)](
         Qf, Kf, Vf, dOf, Lf, Df, dQf,
         q_row_offsets, q_col_indices,
         sm_scale, T, st_b, st_t, st_d, st_lb,
         BLOCK_Q=BLOCK_Q, BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D, D=d,
     )
+
+    # key-block view kernel for dK and dV
     _bwd_dkv_kernel[(BH, T // BLOCK_K)](
         Qf, Kf, Vf, dOf, Lf, Df, dKf, dVf,
         k_row_offsets, k_col_indices,
